@@ -7,7 +7,7 @@ from numba import cuda, float32
 epochs = 10
 neurons1 = 32
 neurons2 = 16
-learning_rate = 0.01
+learning_rate = 1e-4
 
 np.random.seed(1)
 
@@ -114,6 +114,15 @@ def pool_backward(p_grad, o_grad):
 # Prepare data
 data, labels, testdata, testlabels = getMnistData()
 
+def Adam(dx, m, v):
+	beta1 = 0.9
+	beta2 = 0.999
+	eps = 1e-8
+	m = beta1*m + (1-beta1)*dx
+	v = beta2*v + (1-beta2)*(dx**2)
+	newWts = learning_rate * m / (np.sqrt(v) + eps)	
+	return newWts, m, v
+
 def newWts():
 	f1 = np.random.randn(8,3,3,1) * np.sqrt(1.0/9)
 
@@ -139,6 +148,21 @@ def loadWts():
 	return f1,w1,b1,w2,b2,w3,b3
 
 f1,w1,b1,w2,b2,w3,b3 = newWts()
+
+mf1 = np.zeros(f1.shape)
+vf1 = np.zeros(f1.shape)
+mw1 = np.zeros(w1.shape)
+vw1 = np.zeros(w1.shape)
+mb1 = np.zeros(b1.shape)
+vb1 = np.zeros(b1.shape)
+mw2 = np.zeros(w2.shape)
+vw2 = np.zeros(w2.shape)
+mb2 = np.zeros(b2.shape)
+vb2 = np.zeros(b2.shape)
+mw3 = np.zeros(w3.shape)
+vw3 = np.zeros(w3.shape)
+mb3 = np.zeros(b3.shape)
+vb3 = np.zeros(b3.shape)
 
 for epoch_no in range(0,epochs):
 	num_correct = 0
@@ -180,13 +204,20 @@ for epoch_no in range(0,epochs):
 		dx = np.zeros([28,28,1])
 		f1_grad = np.zeros([8,3,3,1])
 		conv_backward(data[index], f1, pro1, o1_grad, dx, f1_grad)	
-		f1 += -1 * learning_rate * f1_grad
-		w1 += -1 * learning_rate * w1_grad
-		b1 += -1 * learning_rate * b1_grad
-		w2 += -1 * learning_rate * w2_grad
-		b2 += -1 * learning_rate * b2_grad
-		w3 += -1 * learning_rate * w3_grad
-		b3 += -1 * learning_rate * b3_grad	
+		f1_,mf1,vf1 = Adam(f1_grad,mf1,vf1)
+		f1 -= f1_
+		w1_,mw1,vw1 = Adam(w1_grad,mw1,vw1)
+		w1 -= w1_
+		b1_,mb1,vb1 = Adam(b1_grad,mb1,vb1)
+		b1 -= b1_
+		w2_,mw2,vw2 = Adam(w2_grad,mw2,vw2)
+		w2 -= w2_
+		b2_,mb2,vb2 = Adam(b2_grad,mb2,vb2)
+		b2 -= b2_
+		w3_,mw3,vw3 = Adam(w3_grad,mw3,vw3)
+		w3 -= w3_
+		b3_,mb3,vb3 = Adam(b3_grad,mb3,vb3)
+		b3 -= b3_		
 
 	print(str(epoch_no) + ": " + 'Training Accuracy: ' + str(num_correct/600) + '%')
 	print('Time taken: ' + str((time()-start)) + 's')
