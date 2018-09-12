@@ -60,56 +60,58 @@ def getMnistData():
 def reLU(x):
 	return np.maximum(0,x)	
 
+def reLU_back(pro,o_grad):
+	o_grad[pro < 0] = 0
+	return o_grad
+
 def sigmoid(x):
 	return 1.0/(1.0 + np.exp(-x))	
 
-@cuda.autojit
-def conv_forward(pic,f,pro,o):
-	height = pic.shape[0] - f.shape[1] + 1
-	width = pic.shape[1] - f.shape[2] + 1
-	depth = pic.shape[2]
-	no_filters = f.shape[0]
-	for f_num in range(0,no_filters):
-		for h in range(0,height):
-			for w in range(0,width):
-				pro[h,w,f_num] = 0
-				for i in range(0,f.shape[1]):
-					for j in range(0,f.shape[2]):
-						for d in range(0,depth):
-							pro[h,w,f_num] += pic[h+i,w+j,d] * f[f_num,i,j,d]
-				o[h,w,f_num] = 0
-				if pro[h,w,f_num] > 0:
-					o[h,w,f_num] = pro[h,w,f_num]
+@cuda.jit
+def cuda_conv_forward(pic,f,pro):
+	tx = cuda.threadIdx.x
+	ty = cuda.threadIdx.y
 
-@cuda.autojit
-def conv_backward(x, f, pro, o_grad, dx, f_grad):
-	for f_num in range(0,f.shape[0]):
-		for h in range(0,o_grad.shape[0]):
-			for w in range(0,o_grad.shape[1]):
-				if pro[h,w,f_num] > 0:
-					for i in range(0,f.shape[1]):
-						for j in range(0,f.shape[2]):
-							for d in range(0,f.shape[3]):
-								dx[h+i,w+j,d] += f[f_num,i,j,d] * o_grad[h,w,f_num]
-								f_grad[f_num,i,j,d] += x[h+i,w+j,d] * o_grad[h,w,f_num]
+	f_num = cuda.blockIdx.x
 
-@cuda.autojit
-def pool_forward(o,p):
-	for h in range(0,p.shape[0]):
-		for w in range(0,p.shape[1]):
-			for d in range(0,p.shape[2]):
-				p[h,w,d] = o[2*h,2*w,d]
-				for i in range(0,2):
-					for j in range(0,2):
-						if o[2*h+i,2*w+j,d] > p[h,w,d]:
-							p[h,w,d] = o[2*h+i,2*w+j,d]
+	fil = f[f_num]
 
-@cuda.autojit
-def pool_backward(p_grad, o_grad):
-	for h in range(0,o_grad.shape[0]):
-		for w in range(0,o_grad.shape[1]):
-			for d in range(0,o_grad.shape[2]):
-				o_grad[h,w,d] = p_grad[int(h/2),int(w/2),d]
+	for i in range(3):
+		for j in range(3):
+			pro[tx, ty, f_num] += pic[tx+i, ty+j, f_num] * fil[i, j, 0]
+
+@cuda.jit
+def cuda_conv_backward(x, f, pro_grad, dx, f_grad):
+	tx = cuda.threadIdx.x
+	ty = cuda.threadIdx.y
+
+	f_num = cuda.blockIdx.x
+
+	fil = f[f_num]
+	for i in range(3):
+		for j in range(3):
+			tmp1 = f[f_num,i,j,0] * pro_grad[tx,ty,f_num]
+			tmp2 = x[tx+i,ty+j,0] * pro_grad[tx,ty,f_num]
+			cuda.atomic.add(dx, (tx+i,ty+j,0), tmp1)
+			cuda.atomic.add(f_grad, (f_num,i,j,0), tmp2)
+
+@cuda.jit
+def cuda_pool_forward(o,p):
+	tx = cuda.threadIdx.x
+	ty = cuda.threadIdx.y
+
+	d = cuda.blockIdx.x
+
+	p[tx,ty,d] = max(o[2*tx,2*ty,d],o[2*tx+1,2*ty,d],o[2*tx,2*ty+1,d],o[2*tx+1,2*ty+1,d])
+
+@cuda.jit
+def cuda_pool_backward(p_grad, o_grad):
+	tx = cuda.threadIdx.x
+	ty = cuda.threadIdx.y
+
+	d = cuda.blockIdx.x
+
+	o_grad[tx,ty,d] = p_grad[int(tx/2),int(ty/2),d]
 
 # Prepare data
 data, labels, testdata, testlabels = getMnistData()
@@ -170,18 +172,23 @@ for epoch_no in range(0,epochs):
 	for index in range(0,60000):
 		o1 = np.zeros([26,26,8])
 		pro1 = np.zeros([26,26,8])
-		conv_forward(data[index], f1, pro1, o1)
+		cuda_conv_forward[(8),(26,26)](data[index], f1, pro1)
+		o1 = reLU(pro1)
 		p1 = np.zeros([13,13,8])
-		pool_forward(o1,p1)
+		cuda_pool_forward[(8),(13,13)](o1,p1)
 		pflat = p1.flatten().reshape(-1,1)
 		l1 = sigmoid(np.matmul(w1,pflat) + b1)
 		l2 = sigmoid(np.matmul(w2, l1) + b2)
 		l3 = sigmoid(np.matmul(w3, l2) + b3)
+		
 		if np.argmax(l3) == np.argmax(labels[index]):
 			num_correct += 1
+		
 		pic_loss = (labels[index] - l3)**2
+		
 		if (index+1)%100 == 0:
 			print(str(epoch_no) + ": " + str(index+1) + ": " + str(pic_loss.sum()))
+		
 		l3_grad = 2 * (l3 - labels[index])
 		sig3_grad = l3_grad * l3 * (1-l3)
 		b3_grad = sig3_grad
@@ -200,10 +207,12 @@ for epoch_no in range(0,epochs):
 		pflat_grad = np.matmul(np.transpose(w1), wx1_grad)
 		p_grad = pflat_grad.reshape(13,13,8)
 		o1_grad = np.zeros([26,26,8])
-		pool_backward(p_grad, o1_grad)
+		cuda_pool_backward[(8),(26,26)](p_grad, o1_grad)
+		pro1_grad = reLU_back(pro1,o1_grad)
 		dx = np.zeros([28,28,1])
 		f1_grad = np.zeros([8,3,3,1])
-		conv_backward(data[index], f1, pro1, o1_grad, dx, f1_grad)	
+		cuda_conv_backward[(8),(26,26)](data[index], f1, pro1_grad, dx, f1_grad)	
+		
 		f1_,mf1,vf1 = Adam(f1_grad,mf1,vf1)
 		f1 -= f1_
 		w1_,mw1,vw1 = Adam(w1_grad,mw1,vw1)
@@ -224,21 +233,19 @@ for epoch_no in range(0,epochs):
 	wts = [f1,w1,b1,w2,b2,w3,b3]
 	saveWeights(wts)
 
-wts = [f1,w1,b1,w2,b2,w3,b3]
-saveWeights(wts)
-
 num_correct = 0
 for index in range(0,10000):
 	o1 = np.zeros([26,26,8])
 	pro1 = np.zeros([26,26,8])
-	conv_forward(testdata[index], f1, pro1, o1)
+	cuda_conv_forward[(8),(26,26)](testdata[index], f1, pro1)
+	o1 = reLU(pro1)
 	p1 = np.zeros([13,13,8])
-	pool_forward(o1,p1)
+	cuda_pool_forward[(8),(13,13)](o1,p1)
 	pflat = p1.flatten().reshape(-1,1)
 	l1 = sigmoid(np.matmul(w1,pflat) + b1)
 	l2 = sigmoid(np.matmul(w2, l1) + b2)
 	l3 = sigmoid(np.matmul(w3, l2) + b3)
-	if np.argmax(l3) == testlabels[index]:
+	if np.argmax(l3) == np.argmax(testlabels[index]):
 		num_correct += 1
 	if (index+1) % 100 == 0:
 		print(str(index+1))
